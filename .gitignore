@@ -1,7 +1,15 @@
+# Python
 __pycache__/
 *.py[cod]
-*.class
+*$py.class
 venv/
+env/
+.venv/
+
+# Docker & Veritabanı
+postgres_data/
 .env
-.vscode/
-.idea/
+
+# Geçici dosyalar
+/tmp/*
+*.log
