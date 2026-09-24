@@ -1,6 +1,8 @@
 import ipaddress
 import json
 import redis
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from celery import Celery, group
 from celery.schedules import crontab
 from celery.exceptions import SoftTimeLimitExceeded
@@ -49,6 +51,34 @@ def _process_autonomous_audit(target: str, current_scan_data: dict):
 
     redis_client.set(history_key, json.dumps(current_scan_data))
 
+def scan_target_port(ip: str, portid: int) -> list:
+    """Tekil port için Nuclei taraması (ThreadPoolExecutor içinde koşar)."""
+    try:
+        return run_nuclei_scan(ip, portid)
+    except Exception:
+        return []
+
+def run_parallel_nuclei_for_hosts(hosts: list):
+    """Hostlar üzerindeki açık portları multithread ile eş zamanlı tarar."""
+    tasks = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for host in hosts:
+            addresses = host.get("addresses", [])
+            if not addresses:
+                continue
+            ip = addresses[0].get("addr")
+            for p in host.get("ports", []):
+                if p.get("state") == "open":
+                    portid = int(p.get("portid", 0))
+                    future = executor.submit(scan_target_port, ip, portid)
+                    tasks.append((p, future))
+
+        for p, future in tasks:
+            try:
+                p["vulnerabilities"] = future.result(timeout=120)
+            except Exception:
+                p["vulnerabilities"] = []
+
 @celery_app.task(bind=True, soft_time_limit=300, time_limit=360)
 def scan_chunk_task(self, chunk_target: str, profile: str = "fast"):
     config = SCAN_PROFILES.get(profile, SCAN_PROFILES["fast"])
@@ -68,17 +98,7 @@ def scan_chunk_task(self, chunk_target: str, profile: str = "fast"):
         service_xml = run_nmap_stage(service_args, target=None)
 
         parsed = parse_full_nmap_xml(service_xml)
-        
-        # Chunk seviyesinde de aktif Nuclei zafiyet taraması entegrasyonu
-        for host in parsed.get("hosts", []):
-            addresses = host.get("addresses", [])
-            if not addresses:
-                continue
-            ip = addresses[0].get("addr")
-            for p in host.get("ports", []):
-                if p.get("state") == "open":
-                    portid = int(p.get("portid", 0))
-                    p["vulnerabilities"] = run_nuclei_scan(ip, portid)
+        run_parallel_nuclei_for_hosts(parsed.get("hosts", []))
 
         return {
             "hosts": parsed.get("hosts", []),
@@ -110,7 +130,7 @@ def run_nmap_scan(self, target: str, profile: str = "balanced", audit_mode: bool
 
         job_group = group(scan_chunk_task.s(chunk, profile) for chunk in chunks)
         group_async = job_group.apply_async()
-        results = group_async.get()
+        results = group_async.get(disable_sync_subtasks=False)
 
         aggregated_hosts = []
         total_open_ports = 0
@@ -131,7 +151,6 @@ def run_nmap_scan(self, target: str, profile: str = "balanced", audit_mode: bool
             "cached": False
         }
         redis_client.setex(cache_key, CACHE_TTL, json.dumps(final_result))
-        
         save_scan_to_postgres(self.request.id or "autonomous_scan", final_result)
         
         if audit_mode:
@@ -160,7 +179,6 @@ def run_nmap_scan(self, target: str, profile: str = "balanced", audit_mode: bool
                 "cached": False
             }
             redis_client.setex(cache_key, CACHE_TTL, json.dumps(final_result))
-            
             save_scan_to_postgres(self.request.id or "autonomous_scan", final_result)
             
             if audit_mode:
@@ -179,17 +197,9 @@ def run_nmap_scan(self, target: str, profile: str = "balanced", audit_mode: bool
 
         parsed_result = parse_full_nmap_xml(service_xml)
         
-        # --- NUCLEI AKTİF ZAFİYET DOĞRULAMA ENTEGRASYONU ---
-        for host in parsed_result.get("hosts", []):
-            addresses = host.get("addresses", [])
-            if not addresses:
-                continue
-            ip = addresses[0].get("addr")
-            for p in host.get("ports", []):
-                if p.get("state") == "open":
-                    portid = int(p.get("portid", 0))
-                    p["vulnerabilities"] = run_nuclei_scan(ip, portid)
-        # ----------------------------------------------------
+        # --- EŞ ZAMANLI NUCLEI TARAMASI ---
+        run_parallel_nuclei_for_hosts(parsed_result.get("hosts", []))
+        # -----------------------------------
 
         parsed_result["target"] = target
         parsed_result["profile"] = profile
@@ -198,7 +208,6 @@ def run_nmap_scan(self, target: str, profile: str = "balanced", audit_mode: bool
         parsed_result["cached"] = False
 
         redis_client.setex(cache_key, CACHE_TTL, json.dumps(parsed_result))
-        
         save_scan_to_postgres(self.request.id or "autonomous_scan", parsed_result)
         
         if audit_mode:

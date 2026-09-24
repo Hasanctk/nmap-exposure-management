@@ -5,7 +5,9 @@ from pydantic import BaseModel, field_validator
 ALLOWED_TARGETS = [
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("127.0.0.1/32")
+    ipaddress.ip_network("172.16.0.0/12"),     # Docker köprü ağları için eklendi
+    ipaddress.ip_network("127.0.0.1/32"),
+    ipaddress.ip_network("45.33.32.156/32"),  # scanme.nmap.org resmi test IP'si
 ]
 
 class ScanRequest(BaseModel):
